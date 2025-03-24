@@ -8,6 +8,7 @@ import numpy as np
 from sklearn.metrics import ndcg_score
 from collections import defaultdict
 import pandas as pd
+import logging
 
 from binary import BinaryHead
 
@@ -21,14 +22,17 @@ class MultiModelBinaryTrainer:
         temp: float = 1.0,
         num_trainable_layers: int = 2,
         lr: float = 2e-5,
-        use_binary_head: bool = True
+        l2: float = 0.0,
+        use_binary_head: bool = True,
+        logger = None
     ):
         self.models = models  # 用于直接获取本地embedding的模型
         self.tokenizers = tokenizers
         self.embedding_funcs = embedding_funcs  # 用于API方式获取embedding的函数
         self.device = device
         self.binary_head = BinaryHead(temp=temp, use_binary_head=use_binary_head).to(device)
-        self.criterion = nn.CosineEmbeddingLoss()
+        self.cos_criterion = nn.CosineEmbeddingLoss()
+        self.logger = logger
         
         for model in self.models:
             self._prepare_model_for_training(model, num_trainable_layers)
@@ -37,7 +41,7 @@ class MultiModelBinaryTrainer:
         if num_trainable_layers > 0:
             for model in self.models:
                 params.extend(filter(lambda p: p.requires_grad, model.parameters()))
-        self.optimizer = optim.Adam(params, lr=lr)
+        self.optimizer = optim.Adam(params, lr=lr, weight_decay=l2)
 
     def _prepare_model_for_training(self, model, num_trainable_layers):
         """准备模型训练，冻结或解冻相应层"""
@@ -89,8 +93,6 @@ class MultiModelBinaryTrainer:
         data_shuffled = data.sample(frac=1, random_state=42)
 
         for i in tqdm(range(num_batches), desc="Training"):
-            current_temp = max(0.01, 1.0 - (current_iter + i) / total_iters)
-            self.binary_head.temp = current_temp
             batch = data_shuffled[i * batch_size : (i + 1) * batch_size]
             batch_loss = 0
             
@@ -99,25 +101,41 @@ class MultiModelBinaryTrainer:
                 emb1 = self.get_embeddings(list(batch["sample1"]), idx)
                 emb2 = self.get_embeddings(list(batch["sample2"]), idx)
                 
-                # 从relevance动态计算pos值：相关性>0为正例(1)，否则为负例(-1)
-                labels = torch.tensor([1 if rel > 0 else -1 for rel in batch["relevance"].values]).float().to(self.device)
+                # 从relevance动态计算目标值
+                binary_labels = torch.tensor([1.0 if rel > 0 else 0.0 for rel in batch["relevance"].values]).float().to(self.device)
+                cos_labels = torch.tensor([1 if rel > 0 else -1 for rel in batch["relevance"].values]).float().to(self.device)
                 
                 if not self.binary_head.use_binary_head:
-                    batch_loss += self.criterion(emb1, emb2, labels)
+                    # 非二值化模式使用余弦相似度损失
+                    batch_loss += self.cos_criterion(emb1, emb2, cos_labels)
                 else:
+                    # 应用二值化头得到二值向量
                     bin_out1 = self.binary_head(emb1)
                     bin_out2 = self.binary_head(emb2)
-                    batch_loss += self.criterion(bin_out1, bin_out2, labels)
+                    
+                    # 汉明距离损失
+                    hamming_dist = torch.abs(bin_out1 - bin_out2).sum(dim=1) / bin_out1.size(1)
+                    hamming_sim = 1.0 - hamming_dist
+                    hamming_loss = torch.mean(torch.abs(hamming_sim - binary_labels))
+                    
+                    # 原始向量的余弦相似度损失
+                    original_loss = self.cos_criterion(emb1, emb2, cos_labels)
+                    
+                    # 组合损失
+                    batch_loss += hamming_loss
 
             # 平均所有模型的loss
             loss = batch_loss / (len(self.models) + len(self.embedding_funcs))
             self.optimizer.zero_grad()
             loss.backward()
-            self.optimizer.step()
             
+            # 梯度裁剪，防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(self.binary_head.parameters(), max_norm=1.0)
+            
+            self.optimizer.step()
             total_loss += loss.item()
 
-        return total_loss / len(data)
+        return total_loss / num_batches
 
     def eval_epoch(self, data, batch_size):
         self.binary_head.eval()
@@ -136,16 +154,25 @@ class MultiModelBinaryTrainer:
                     emb1 = self.get_embeddings(list(batch["sample1"]), idx)
                     emb2 = self.get_embeddings(list(batch["sample2"]), idx)
                     
-                    # 从relevance动态计算pos值
-                    labels = torch.tensor([1 if rel > 0 else -1 for rel in batch["relevance"].values]).float().to(self.device)
-
-                    out1 = self.binary_head(emb1)
-                    out2 = self.binary_head(emb2)
-                    batch_loss += self.criterion(out1, out2, labels)
+                    # 从relevance动态计算标签
+                    binary_labels = torch.tensor([1.0 if rel > 0 else 0.0 for rel in batch["relevance"].values]).float().to(self.device)
+                    cos_labels = torch.tensor([1 if rel > 0 else -1 for rel in batch["relevance"].values]).float().to(self.device)
+                    
+                    if not self.binary_head.use_binary_head:
+                        # 非二值化模式
+                        batch_loss += self.cos_criterion(emb1, emb2, cos_labels)
+                    else:
+                        # 二值化模式：简化版损失计算
+                        bin_out1 = self.binary_head(emb1)
+                        bin_out2 = self.binary_head(emb2)
+                        
+                        hamming_dist = torch.abs(bin_out1 - bin_out2).sum(dim=1) / bin_out1.size(1)
+                        hamming_sim = 1.0 - hamming_dist
+                        batch_loss += torch.mean(torch.abs(hamming_sim - binary_labels))
 
                 total_loss += batch_loss.item() / (len(self.models) + len(self.embedding_funcs))
 
-        return total_loss / len(data)
+        return total_loss / num_batches
         
     def calculate_ndcg10(self, data: pd.DataFrame) -> dict:
         
@@ -171,7 +198,7 @@ class MultiModelBinaryTrainer:
 
             for model_idx in range(total_model_count):
                 model_name = f"model_{model_idx}"
-                print(f"\n开始计算 {lang} 语言模型 {model_idx} 的NDCG@10")
+                self.logger.info(f"开始计算 {lang} 语言模型 {model_idx} 的NDCG@10")
                 
                 # 收集所有唯一的查询和文档
                 queries = {}         # 查询ID -> 查询文本
@@ -197,7 +224,7 @@ class MultiModelBinaryTrainer:
                 # 在实际应用中，你可能需要加载完整的语料库文件
                 corpus_docs = documents  # 使用已有的所有文档作为语料库
                 
-                print(f"收集到 {len(queries)} 个唯一查询和 {len(corpus_docs)} 个语料库文档")
+                self.logger.info(f"收集到 {len(queries)} 个唯一查询和 {len(corpus_docs)} 个语料库文档")
                 
                 # 批量计算所有查询的embedding
                 query_embeddings = {}  # 查询ID -> embedding
@@ -247,7 +274,7 @@ class MultiModelBinaryTrainer:
                 
                 for query_id in tqdm(queries.keys(), desc="计算NDCG@10"):
                     if query_id not in query_embeddings:
-                        print(f"警告: 查询 {query_id} 没有embedding")
+                        self.logger.info(f"警告: 查询 {query_id} 没有embedding")
                         continue
                     
                     query_emb = query_embeddings[query_id]
@@ -256,11 +283,19 @@ class MultiModelBinaryTrainer:
                     doc_similarities = []  # [(doc_id, similarity), ...]
                     
                     for doc_id, doc_emb in corpus_embeddings.items():
-                        sim = torch.nn.functional.cosine_similarity(query_emb, doc_emb).item()
+                        if self.binary_head.use_binary_head:
+                            # 改进的二值化相似度计算
+                            # 汉明距离：计算两个二进制向量中不同位的数量除以总位数
+                            hamming_dist = torch.abs(query_emb - doc_emb).sum() / query_emb.size(1)
+                            # 汉明相似度 = 1 - 汉明距离
+                            sim = 1.0 - hamming_dist.item()
+                        else:
+                            # 非二值化向量使用余弦相似度
+                            sim = torch.nn.functional.cosine_similarity(query_emb, doc_emb).item()
                         doc_similarities.append((doc_id, sim))
                     
-                    # 按相似度降序排序
-                    doc_similarities.sort(key=lambda x: x[1], reverse=True)
+                    # 按相似度降序排序，当相似度相等时，使用相关性作为第二排序键
+                    doc_similarities.sort(key=lambda x: (x[1], qrels.get(query_id, {}).get(x[0], 0)), reverse=True)
                     
                     # 取前K个进行评估
                     k = 10
@@ -275,37 +310,49 @@ class MultiModelBinaryTrainer:
                     
                     # 计算NDCG@10
                     try:
-                        ndcg_val = ndcg_score(
-                            y_true=[y_true],  # 真实相关性
-                            y_score=[y_score],  # 预测相似度
-                            k=k
-                        )
+                        # 使用我们已经排序好的列表直接计算NDCG
+                        # 不依赖ndcg_score内部排序
+                        k = min(k, len(y_true))
+                        # 计算DCG
+                        dcg = 0
+                        for i in range(k):
+                            dcg += y_true[i] / np.log2(i + 2)  # i+2 因为log2(1)=0
+                        
+                        # 计算IDCG
+                        ideal_relevance = sorted(y_true, reverse=True)
+                        idcg = 0
+                        for i in range(k):
+                            if i < len(ideal_relevance):
+                                idcg += ideal_relevance[i] / np.log2(i + 2)
+                        
+                        # 计算NDCG
+                        ndcg_val = dcg / idcg if idcg > 0 else 0.0
                         ndcg_list.append(ndcg_val)
                         
                         # 打印一些样本的详细信息以便调试
-                        if len(ndcg_list) <= 3:  # 只打印前3个查询的详细信息
-                            print(f"\n查询ID: {query_id}")
-                            print(f"查询文本: {queries[query_id]}")
-                            print(f"Top {k} 结果:")
+                        if len(ndcg_list) <= 1:  # 只打印前1个查询的详细信息
+                            self.logger.info(f"查询ID: {query_id}")
+                            self.logger.info(f"查询文本: {queries[query_id]}")
+                            self.logger.info(f"Top {k} 结果:")
                             for i, (doc_id, sim) in enumerate(doc_similarities[:k]):
                                 relevance = qrels.get(query_id, {}).get(doc_id, 0)
                                 doc_snippet = corpus_docs[doc_id][:50] + "..." if len(corpus_docs[doc_id]) > 50 else corpus_docs[doc_id]
-                                print(f"  {i+1}. 文档ID: {doc_id}, 相关性: {relevance}, 相似度: {sim:.4f}")
-                                print(f"     文档片段: {doc_snippet}")
-                            print(f"NDCG@{k}: {ndcg_val:.4f}")
+                                self.logger.info(f"  {i+1}. 文档ID: {doc_id}, 相关性: {relevance}, 相似度: {sim:.4f}")
+                                self.logger.info(f"     文档片段: {doc_snippet}")
+                            self.logger.info(f"NDCG@{k}: {ndcg_val:.4f}")
                         
                     except Exception as e:
-                        print(f"查询 {query_id} 计算NDCG出错: {e}")
+                        self.logger.info(f"查询 {query_id} 计算NDCG出错: {e}")
                         continue
                 
                 # 计算该模型在当前语言上的平均NDCG@10
                 if ndcg_list:
                     avg_ndcg = float(np.mean(ndcg_list))
                     results[lang][model_name] = avg_ndcg
-                    print(f"\n{lang} 语言模型 {model_idx} 的平均NDCG@10: {avg_ndcg:.4f}")
+                    self.logger.info(f"{lang} 语言模型 {model_idx} 的平均NDCG@10: {avg_ndcg:.4f}")
                 else:
                     results[lang][model_name] = 0.0
-                    print(f"\n{lang} 语言模型 {model_idx} 没有有效的NDCG@10结果")
+                    self.logger.info(f"{lang} 语言模型 {model_idx} 没有有效的NDCG@10结果")
 
         return results
 
@@ -320,7 +367,7 @@ class MultiModelBinaryTrainer:
     def train_binary_head(self, train_data, val_data, test_data, epochs, batch_size, output_dir):
         # 检查训练集是否为空
         if len(train_data) == 0:
-            print("训练集为空，跳过训练过程，直接进行评估...")
+            self.logger.info("训练集为空，跳过训练过程，直接进行评估...")
             # 初始化binary_head为评估模式
             self.binary_head.training = False
             
@@ -329,11 +376,11 @@ class MultiModelBinaryTrainer:
                 # 计算检索评估指标
                 if 'query_id' in test_data.columns and 'relevance' in test_data.columns:
                     retrieval_results = self.evaluate_retrieval(test_data, batch_size)
-                    print(f"检索评估结果 (NDCG@10):")
+                    self.logger.info(f"检索评估结果 (NDCG@10):")
                     for lang, models_results in retrieval_results.items():
-                        print(f"  语言: {lang}")
+                        self.logger.info(f"  语言: {lang}")
                         for model_name, ndcg in models_results.items():
-                            print(f"    {model_name}: {ndcg:.4f}")
+                            self.logger.info(f"    {model_name}: {ndcg:.4f}")
             return
         
         num_batches_per_epoch = max(int(len(train_data) / batch_size + 0.99), 1)
@@ -342,6 +389,7 @@ class MultiModelBinaryTrainer:
         current_iter = 0
         best_loss = float('inf')
         
+        
         for epoch in range(epochs):
             train_loss = self.train_epoch(train_data, batch_size, current_iter, total_iters)
             current_iter += num_batches_per_epoch
@@ -349,39 +397,35 @@ class MultiModelBinaryTrainer:
             # 检查验证集是否为空
             if val_data is not None and len(val_data) > 0:
                 val_loss = self.eval_epoch(val_data, batch_size)
-                print(f"Epoch: {epoch+1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Current Temp: {self.binary_head.temp:.4f}")
+                self.logger.info(f"Epoch: {epoch+1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
                 if val_loss < best_loss:
                     best_loss = val_loss
-                    print(f"新的最佳验证损失: {best_loss:.4f}, 保存模型...")
+                    self.logger.info(f"新的最佳验证损失: {best_loss:.4f}, 保存模型...")
                     self.binary_head.save_model(f"{output_dir}/best_model")
             else:
-                print(f"Epoch: {epoch+1}, Train Loss: {train_loss:.4f}, Current Temp: {self.binary_head.temp:.4f}")
+                self.logger.info(f"Epoch: {epoch+1}, Train Loss: {train_loss:.4f}")
                 # 没有验证集时，直接保存每个epoch的模型
-                print(f"保存当前epoch模型...")
+                self.logger.info(f"保存当前epoch模型...")
                 self.binary_head.save_model(f"{output_dir}/epoch_{epoch+1}")
 
-        print("重新加载最佳模型进行评估...")
+        self.logger.info("重新加载最佳模型进行评估...")
         original_use_binary_head = self.binary_head.use_binary_head
         self.binary_head = BinaryHead.load_model(
-            f"{output_dir}/binary_head_full.pt",
+            f"{output_dir}/best_model/binary_head_full.pt",
             self.device
         )
         self.binary_head.use_binary_head = original_use_binary_head
         self.binary_head.training = False
-        print(f"评估设置：use_binary_head={self.binary_head.use_binary_head}, training={self.binary_head.training}")
-        
-        # 对测试集进行评估(损失和NDCG@10)
-        # test_loss = self.eval_epoch(test_data, batch_size)
-        # print(f"测试损失: {test_loss:.4f}")
+        self.logger.info(f"评估设置：use_binary_head={self.binary_head.use_binary_head}, training={self.binary_head.training}")
         
         # 计算检索评估指标
         if test_data is not None and len(test_data) > 0 and 'query_id' in test_data.columns and 'relevance' in test_data.columns:
             retrieval_results = self.evaluate_retrieval(test_data, batch_size)
-            print(f"检索评估结果 (NDCG@10):")
+            self.logger.info(f"检索评估结果 (NDCG@10):")
             for lang, models_results in retrieval_results.items():
-                print(f"  语言: {lang}")
+                self.logger.info(f"  语言: {lang}")
                 for model_name, ndcg in models_results.items():
-                    print(f"    {model_name}: {ndcg:.4f}")
+                    self.logger.info(f"    {model_name}: {ndcg:.4f}")
 
 
 
@@ -395,15 +439,15 @@ def train(
     device: torch.device = None,
     epochs: int = 10,
     lr: float = 2e-5,
+    l2: float = 0.0,
     batch_size: int = 4,
     temp: float = 1.0,
     num_trainable_layers: int = 1,
     output_dir: str = "project/models/binary_head",
-    use_binary_head: bool = True
+    use_binary_head: bool = True,
+    logger = None
 ):
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
+
     trainer = MultiModelBinaryTrainer(
         models=models,
         tokenizers=tokenizers,
@@ -412,10 +456,12 @@ def train(
         temp=temp,
         num_trainable_layers=num_trainable_layers,
         lr=lr,
-        use_binary_head=use_binary_head
+        l2=l2,
+        use_binary_head=use_binary_head,
+        logger=logger
     )
-    
-    trainer.train_binary_head(
+
+    results = trainer.train_binary_head(
         train_data=train_data,
         val_data=val_data,
         test_data=test_data,
@@ -423,4 +469,7 @@ def train(
         batch_size=batch_size,
         output_dir=output_dir
     )
+    
+    logger.info(f"训练完成，最终评估结果: {results}")
+    return results
         

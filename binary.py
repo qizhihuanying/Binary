@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class BinaryHead(nn.Module):
     def __init__(self, unified_dim=512, output_dim=256, temp=1.0, use_binary_head=True):
@@ -9,20 +10,27 @@ class BinaryHead(nn.Module):
         Args:
             unified_dim: 统一的中间维度，所有输入都会先映射到这个维度
             output_dim: 最终的二值化输出维度
-            temp: 温度参数
+            temp: 已不再使用的参数，保留只是为了接口兼容
             use_binary_head: 是否使用二值化头
         """
         super().__init__()
         self.unified_dim = unified_dim
         self.output_dim = output_dim
-        self.temp = temp
+        self.temp = 1.0  # 不再使用
         self.use_binary_head = use_binary_head
         self.training = True
         
         # 维度统一层字典
         self.dim_unifiers = nn.ModuleDict()
-        # 共享的二值化投影层
-        self.binary_projector = nn.Linear(unified_dim, output_dim)
+
+        self.binary_projector = nn.Sequential(
+            nn.Linear(unified_dim, unified_dim // 2),
+            nn.BatchNorm1d(unified_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(unified_dim // 2, output_dim),
+            nn.BatchNorm1d(unified_dim // 2),
+            nn.LeakyReLU(0.2),
+        )
         
     def get_dim_unifier(self, input_dim):
         dim_key = str(input_dim)
@@ -31,9 +39,26 @@ class BinaryHead(nn.Module):
                 nn.Linear(input_dim, self.unified_dim),
                 nn.LayerNorm(self.unified_dim)
             )
-            unifier = unifier.to(self.binary_projector.weight.device)
+            unifier = unifier.to(next(self.binary_projector.parameters()).device)
             self.dim_unifiers[dim_key] = unifier
         return self.dim_unifiers[dim_key]
+
+    class BinarySTE(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, input):
+            # 保存输入用于反向传播
+            ctx.save_for_backward(input)
+            # 二值化为0和1
+            return (input > 0).float()
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            input, = ctx.saved_tensors
+            # 只对[-1, 1]范围内的值传递梯度
+            grad_input = grad_output.clone()
+            # 对于太小或太大的值，梯度设为0
+            grad_input = grad_input * (torch.abs(input) <= 1).float()
+            return grad_input
 
     def forward(self, x):
         input_dim = x.size(-1)
@@ -47,12 +72,16 @@ class BinaryHead(nn.Module):
             
         dim_unifier = self.get_dim_unifier(input_dim)
         x = dim_unifier(x)
+        
+        # 应用完整的处理流程
         x = self.binary_projector(x)
+        
         if self.training:
-            x = torch.sigmoid(x / self.temp)
+            # 训练时使用STE进行二值化
+            return self.BinarySTE.apply(x)
         else:
-            x = (x > 0).float()
-        return x
+            # 推理时使用硬二值化
+            return (x > 0).float()
     
     def save_model(self, output_dir):
         output_path = Path(output_dir)

@@ -6,11 +6,30 @@ from functools import partial
 from transformers import AutoModel, AutoTokenizer
 import os
 import json
+import logging
+from datetime import datetime
 
 from _models.huggingface.huggingface import get_device
 from _models.model import get_embedding_func_batched
 from trainer import train
 
+# 配置日志
+def setup_logging(model_name, lang, lr, l2):
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"{model_name}+{lang}+lr={lr}+l2={l2}.log"
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
 
 MIRACL_LANGUAGES = [
     "ar", "bn", "en", "es", "fi", "fr", "hi", "id", 
@@ -24,6 +43,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="project/models/binary_head", help="Output directory for models")
     parser.add_argument("--epochs", type=int, default=0, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
+    parser.add_argument('--l2', type=float, default=1e-6, help='weight_decay')
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--temp", type=float, default=1.0, help="Temperature parameter")
     parser.add_argument("--test_ratio", type=float, default=1.0, help="Test set ratio")
@@ -227,35 +247,47 @@ def save_results(results, args):
 
 def main():
     args = parse_args()
-    device = get_device(use_gpu=True)
-    print(f"Using device: {device}")
-
-    print("\n======= Parameters =======")
-    for arg, value in vars(args).items():
-        print(f"{arg}: {value}")
-    print("=======================\n")
-
-    train_data, val_data, test_data = prepare_data(args)
-
+    logger = setup_logging(args.local_model_names[0], args.langs[0], args.lr, args.l2)
+    logger.info("开始训练过程")
+    logger.info(f"参数配置: {args}")
+    
+    device = get_device()
+    logger.info(f"使用设备: {device}")
+    
+    # 加载模型
     models, tokenizers = load_local_models(args.local_model_names, device)
+    logger.info(f"成功加载模型: {args.local_model_names}")
     embedding_funcs = prepare_api_embedding_funcs(args.api_model_names)
-
-    train(
-        models=models,
-        tokenizers=tokenizers,
-        embedding_funcs=embedding_funcs,
-        train_data=train_data,
-        val_data=val_data,
-        test_data=test_data,
-        device=device,
-        epochs=args.epochs,
-        lr=args.lr,
-        batch_size=args.batch_size,
-        temp=args.temp,
-        num_trainable_layers=args.base_trainable_layers,
-        output_dir=args.output_dir,
-        use_binary_head=args.use_binary_head
-    )
+    logger.info(f"成功加载API模型: {args.api_model_names}")
+    
+    # 准备数据
+    train_data, val_data, test_data = prepare_data(args)
+    logger.info(f"数据准备完成 - 训练集大小: {len(train_data)}, 验证集大小: {len(val_data)}, 测试集大小: {len(test_data)}")
+    
+    # 训练过程
+    if args.epochs > 0:
+        logger.info("开始训练...")
+        train(
+            models=models,
+            tokenizers=tokenizers,
+            embedding_funcs=embedding_funcs,
+            train_data=train_data,
+            val_data=val_data,
+            test_data=test_data,
+            device=device,
+            epochs=args.epochs,
+            lr=args.lr,
+            l2=args.l2,
+            batch_size=args.batch_size,
+            temp=args.temp,
+            num_trainable_layers=args.base_trainable_layers,
+            output_dir=args.output_dir,
+            use_binary_head=args.use_binary_head,
+            logger=logger
+        )
+        logger.info("训练完成")
+    
+    logger.info("程序执行完成")
 
 
 if __name__ == "__main__":
