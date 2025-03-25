@@ -9,6 +9,7 @@ from sklearn.metrics import ndcg_score
 from collections import defaultdict
 import pandas as pd
 import logging
+import os
 
 from binary import BinaryHead
 
@@ -310,13 +311,11 @@ class MultiModelBinaryTrainer:
                     
                     # 计算NDCG@10
                     try:
-                        # 使用我们已经排序好的列表直接计算NDCG
-                        # 不依赖ndcg_score内部排序
                         k = min(k, len(y_true))
                         # 计算DCG
                         dcg = 0
                         for i in range(k):
-                            dcg += y_true[i] / np.log2(i + 2)  # i+2 因为log2(1)=0
+                            dcg += y_true[i] / np.log2(i + 2) 
                         
                         # 计算IDCG
                         ideal_relevance = sorted(y_true, reverse=True)
@@ -389,7 +388,6 @@ class MultiModelBinaryTrainer:
         current_iter = 0
         best_loss = float('inf')
         
-        
         for epoch in range(epochs):
             train_loss = self.train_epoch(train_data, batch_size, current_iter, total_iters)
             current_iter += num_batches_per_epoch
@@ -404,9 +402,10 @@ class MultiModelBinaryTrainer:
                     self.binary_head.save_model(f"{output_dir}/best_model")
             else:
                 self.logger.info(f"Epoch: {epoch+1}, Train Loss: {train_loss:.4f}")
-                # 没有验证集时，直接保存每个epoch的模型
-                self.logger.info(f"保存当前epoch模型...")
-                self.binary_head.save_model(f"{output_dir}/epoch_{epoch+1}")
+                # 没有验证集时，保存最终epoch的模型作为最佳模型
+                if epoch == epochs - 1:  # 如果是最后一个epoch
+                    self.logger.info(f"保存最终epoch模型作为最佳模型...")
+                    self.binary_head.save_model(f"{output_dir}/best_model")
 
         self.logger.info("重新加载最佳模型进行评估...")
         original_use_binary_head = self.binary_head.use_binary_head

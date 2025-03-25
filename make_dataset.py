@@ -357,7 +357,7 @@ def main():
     parser = argparse.ArgumentParser(description="处理MIRACL数据集")
     parser.add_argument("--langs", nargs="+", default=None, help="要处理的语言列表，如ar bn")
     parser.add_argument("--force_hf", action="store_true", default=False, help="强制使用Hugging Face加载数据集")
-    parser.add_argument("--num_negatives", type=int, default=None, help="每个查询要生成的负样本数量，0表示不添加负样本，None表示使用全部负样本")
+    parser.add_argument("--num_negatives", type=int, default=0, help="每个查询要生成的负样本数量，0表示不添加负样本，None表示使用全部负样本")
     parser.add_argument("--include_train", action="store_true", default=False, help="是否同时处理训练集")
     args = parser.parse_args()
     

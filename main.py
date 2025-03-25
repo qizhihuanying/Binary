@@ -14,12 +14,15 @@ from _models.model import get_embedding_func_batched
 from trainer import train
 
 # 配置日志
-def setup_logging(model_name, lang, lr, l2):
-    log_dir = Path("logs")
+def setup_logging(model_name, lang, lr, l2, log_dir=None, log_file=None):
+    log_dir = Path(log_dir) if log_dir else Path("logs")
     log_dir.mkdir(exist_ok=True)
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"{model_name}+{lang}+lr={lr}+l2={l2}.log"
+    if log_file:
+        log_file = log_dir / log_file
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = log_dir / f"{model_name}+{lang}+lr={lr}+l2={l2}.log"
     
     logging.basicConfig(
         level=logging.INFO,
@@ -41,19 +44,22 @@ def parse_args():
     parser.add_argument("--local_model_names", type=str, nargs="+", default=["intfloat/multilingual-e5-base"], help="List of local model names")
     parser.add_argument("--api_model_names", type=str, nargs="+", default=[], help="List of API model names")
     parser.add_argument("--output_dir", type=str, default="project/models/binary_head", help="Output directory for models")
-    parser.add_argument("--epochs", type=int, default=0, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
-    parser.add_argument('--l2', type=float, default=1e-6, help='weight_decay')
+    parser.add_argument("--device", type=str, default='0', help="指定使用的设备，例如'0'表示使用cuda:0，'cpu'表示使用CPU")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=2e-6, help="Learning rate")
+    parser.add_argument('--l2', type=float, default=0.0, help='weight_decay')
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--temp", type=float, default=1.0, help="Temperature parameter")
+    parser.add_argument("--train_sample_ratio", type=float, default=1.0, help="Ratio of training data to use from train split")
+    parser.add_argument("--val_ratio", type=float, default=0.2, help="Validation set ratio except test set")
     parser.add_argument("--test_ratio", type=float, default=1.0, help="Test set ratio")
-    parser.add_argument("--val_ratio", type=float, default=0.0, help="Validation set ratio except test set")
     parser.add_argument("--base_trainable_layers", type=int, default=0, help="Number of trainable layers in base model")
     parser.add_argument("--use_binary_head", action="store_true", default=False, help="Whether to use binary head")
     parser.add_argument("--dataset", type=str, default="miracl", help="Dataset name, currently only 'miracl' is supported")
     parser.add_argument("--langs", type=str, nargs="+", default=["zh"], help="Languages to process for MIRACL dataset (e.g., ar bn)")
-    parser.add_argument("--results_dir", type=str, default="results", help="Directory to save evaluation results")
-    parser.add_argument("--train_sample_ratio", type=float, default=0.2, help="Ratio of training data to use from train split")
+    parser.add_argument("--log_dir", type=str, default="logs/debug", help="Directory to save log files")
+    parser.add_argument("--log_file", type=str, default="debug.log", help="Log file name (default: auto-generated based on model and parameters)")
+    parser.add_argument("--model_name_with_params", action="store_true", default=False, help="Whether to add hyperparameters to model filename")
     
     return parser.parse_args()
 
@@ -72,12 +78,12 @@ def load_local_models(model_names, device):
     return models, tokenizers
 
 
-def prepare_api_embedding_funcs(model_names):
+def prepare_api_embedding_funcs(model_names, device_id=None):
     embedding_funcs = []
     
     for model_name in model_names:
         print(f"准备API模型: {model_name}")
-        embedding_funcs.append(partial(get_embedding_func_batched(model_name)))
+        embedding_funcs.append(partial(get_embedding_func_batched(model_name), device_id=device_id))
     
     return embedding_funcs
 
@@ -214,9 +220,10 @@ def save_results(results, args):
         print("没有评估结果可保存")
         return
         
-    # 创建结果目录
-    results_dir = Path(args.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    # 获取实际使用的模型保存路径
+    output_dir = get_unique_model_path(args)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
     
     # 提取模型名称
     model_names = []
@@ -230,13 +237,19 @@ def save_results(results, args):
         "dataset": args.dataset,
         "langs": args.langs,
         "use_binary_head": args.use_binary_head,
+        "hyperparams": {
+            "lr": args.lr,
+            "l2": args.l2,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size
+        },
         "models": model_names,
         "results": results
     }
     
-    # 生成唯一的文件名
-    filename = f"{args.dataset}_{'with' if args.use_binary_head else 'without'}_binary_head.json"
-    file_path = results_dir / filename
+    # 生成结果文件名
+    filename = "evaluation_results.json"
+    file_path = output_path / filename
     
     # 保存结果
     with open(file_path, "w", encoding="utf-8") as f:
@@ -245,19 +258,47 @@ def save_results(results, args):
     print(f"结果已保存到 {file_path}")
 
 
+def get_unique_model_path(args):
+    """
+    根据超参数创建唯一的模型保存路径
+    """
+    if not args.model_name_with_params:
+        return args.output_dir
+        
+    # 提取模型名称基础部分
+    base_model_name = os.path.basename(args.output_dir)
+    
+    # 格式化超参
+    lr_str = f"{args.lr:.0e}".replace('+', '')
+    l2_str = f"{args.l2:.0e}".replace('+', '')
+    ep_str = str(args.epochs)
+    
+    # 构建唯一名称
+    unique_dir = f"{base_model_name}+lr={lr_str}+l2={l2_str}+epoch={ep_str}"
+    
+    # 创建完整路径
+    parent_dir = os.path.dirname(args.output_dir)
+    full_path = os.path.join(parent_dir, unique_dir)
+    
+    # 确保目录存在
+    os.makedirs(full_path, exist_ok=True)
+    
+    return full_path
+
+
 def main():
     args = parse_args()
-    logger = setup_logging(args.local_model_names[0], args.langs[0], args.lr, args.l2)
+    logger = setup_logging(args.local_model_names[0], args.langs[0], args.lr, args.l2, args.log_dir, args.log_file)
     logger.info("开始训练过程")
     logger.info(f"参数配置: {args}")
     
-    device = get_device()
+    device = get_device(device_id=args.device)
     logger.info(f"使用设备: {device}")
     
     # 加载模型
     models, tokenizers = load_local_models(args.local_model_names, device)
     logger.info(f"成功加载模型: {args.local_model_names}")
-    embedding_funcs = prepare_api_embedding_funcs(args.api_model_names)
+    embedding_funcs = prepare_api_embedding_funcs(args.api_model_names, device_id=args.device)
     logger.info(f"成功加载API模型: {args.api_model_names}")
     
     # 准备数据
@@ -267,6 +308,11 @@ def main():
     # 训练过程
     if args.epochs > 0:
         logger.info("开始训练...")
+        
+        # 获取唯一的模型保存路径
+        model_save_path = get_unique_model_path(args)
+        logger.info(f"模型将保存到: {model_save_path}")
+        
         train(
             models=models,
             tokenizers=tokenizers,
@@ -281,7 +327,7 @@ def main():
             batch_size=args.batch_size,
             temp=args.temp,
             num_trainable_layers=args.base_trainable_layers,
-            output_dir=args.output_dir,
+            output_dir=model_save_path,
             use_binary_head=args.use_binary_head,
             logger=logger
         )

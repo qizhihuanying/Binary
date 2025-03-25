@@ -12,9 +12,17 @@ curr_tokenizer = None
 curr_model = None
 
 
-def get_device(use_gpu=True):
+def get_device(use_gpu=True, device_id=None):
     if not use_gpu:
         device = "cpu"
+    elif device_id is not None:
+        if device_id == "cpu":
+            device = "cpu"
+        elif torch.cuda.is_available():
+            device = f"cuda:{device_id}"
+        else:
+            print(f"警告: 指定了GPU {device_id}，但CUDA不可用。使用CPU代替。")
+            device = "cpu"
     elif torch.cuda.is_available():
         device = "cuda"
     elif torch.backends.mps.is_available():
@@ -60,8 +68,9 @@ def get_huggingface_embeddings_batched(
     model_name: str = "BAAI/bge-small-en-v1.5",
     pbar: bool = False,
     use_gpu: bool = False,
+    device_id: str = None,
 ) -> list[list[float]]:
-    device = get_device(use_gpu=use_gpu)
+    device = get_device(use_gpu=use_gpu, device_id=device_id)
     model, tokenizer = load_model(model_name, device)
 
     num_batches = math.ceil(len(prompts) / batch_size)
@@ -92,8 +101,8 @@ def get_huggingface_embeddings_batched(
     return torch.vstack(embeddings).detach().tolist()
 
 
-def get_huggingface_embedding(prompt: str, model: str = "BAAI/bge-small-en-v1.5") -> list[float]:
-    device = get_device()
+def get_huggingface_embedding(prompt: str, model: str = "BAAI/bge-small-en-v1.5", device_id: str = None) -> list[float]:
+    device = get_device(device_id=device_id)
     model, tokenizer = load_model(model)
     model = model.to(device)
 
@@ -131,9 +140,9 @@ def get_huggingface_embeddings_api(prompts: list[str], model: str = "BAAI/bge-sm
 
 
 def get_huggingface_response(
-    prompt: str, system_prompt: str | None = None, model: str = "facebook/opt-125m"
+    prompt: str, system_prompt: str | None = None, model: str = "facebook/opt-125m", device_id: str = None
 ) -> str:
-    device = get_device()
+    device = get_device(device_id=device_id)
     model, tokenizer = load_model(model)
     model = model.to(device)
 
@@ -150,8 +159,9 @@ def get_huggingface_response_batched(
     batch_size: int = 128,
     model: str = "facebook/opt-125m",
     pbar: bool = False,
+    device_id: str = None,
 ) -> list[str]:
-    device = get_device()
+    device = get_device(device_id=device_id)
     model, tokenizer = load_model(model)
     model = model.to(device)
 
